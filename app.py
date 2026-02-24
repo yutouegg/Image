@@ -187,10 +187,27 @@ def _image_to_base64(image: Image.Image, mime_type: str = "image/png") -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def _guess_mime_type(filename: str, fallback: str = "image/png") -> str:
+    if not filename:
+        return fallback
+    lower = filename.lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    return fallback
+
+
 def _file_to_base64(uploaded_file) -> Tuple[str, str]:
-    data = uploaded_file.read()
-    uploaded_file.seek(0)
-    mime_type = uploaded_file.type or "image/png"
+    if hasattr(uploaded_file, "getvalue"):
+        data = uploaded_file.getvalue()
+    else:
+        data = uploaded_file.read()
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+    mime_type = uploaded_file.type or _guess_mime_type(getattr(uploaded_file, "name", ""), "image/png")
     return base64.b64encode(data).decode("utf-8"), mime_type
 
 
@@ -271,6 +288,8 @@ def _apiyi_edit_image(
 ) -> Tuple[List[Image.Image], str, dict]:
     endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
     image_b64, mime_type = _file_to_base64(image_file)
+    if not image_b64:
+        raise ValueError("上传图片为空或无法读取，请重新上传后再试。")
     generation_config = {"responseModalities": ["IMAGE"]}
     image_config = {}
     if aspect_ratio:
