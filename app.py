@@ -208,28 +208,25 @@ def _require_api_key() -> str:
 
 def _apiyi_generate_image(
     prompt: str,
-    images: Optional[List[Tuple[str, str]]] = None,
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
 ) -> Tuple[List[Image.Image], str, dict]:
-    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
-    generation_config = {"responseModalities": ["IMAGE"]}
-    image_config: Dict[str, str] = {}
-    if aspect_ratio:
-        image_config["aspectRatio"] = aspect_ratio
-    if image_size:
-        image_config["imageSize"] = image_size
-    if image_config:
-        generation_config["imageConfig"] = image_config
-
-    parts: List[Dict[str, Dict[str, str]]] = [{"text": prompt}]
-    if images:
-        data, mime_type = images[0]
-        parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
+    endpoint = f"{APIYI_BASE}/v1/images/generations"
+    size_map = {
+        "1K": "1024x1024",
+        "2K": "2048x2048",
+        "4K": "4096x4096",
+    }
+    if aspect_ratio and aspect_ratio != "1:1":
+        raise ValueError("Nano Banana Pro 4K 仅支持 1:1 方图，请选择 1:1。")
 
     payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": generation_config,
+        "model": IMAGE_MODEL,
+        "prompt": prompt,
+        "n": 1,
+        "size": size_map.get(image_size or "1K", "1024x1024"),
+        "quality": "hd",
+        "response_format": "url",
     }
 
     data = {}
@@ -250,51 +247,58 @@ def _apiyi_generate_image(
                 sleep_for = base_delay * (2 ** attempt) + random.uniform(0, 0.7)
             time.sleep(min(sleep_for, 12))
             continue
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise ValueError(response.text)
         data = response.json()
         break
 
     images_out: List[Image.Image] = []
     texts: List[str] = []
-    for candidate in data.get("candidates", []):
-        content = candidate.get("content", {})
-        for part in content.get("parts", []):
-            if "text" in part:
-                texts.append(part["text"])
-            elif "inline_data" in part and part["inline_data"].get("data"):
-                raw = base64.b64decode(part["inline_data"]["data"])
-                images_out.append(Image.open(io.BytesIO(raw)))
-
+    first = (data.get("data") or [{}])[0]
+    image_url = first.get("url")
+    if image_url:
+        img_resp = requests.get(image_url, timeout=120)
+        img_resp.raise_for_status()
+        images_out.append(Image.open(io.BytesIO(img_resp.content)))
     return images_out, "\n".join(texts).strip(), data
 
 
 def _apiyi_generate_video(image_file, prompt: str) -> bytes:
     create_resp = requests.post(
         f"{APIYI_BASE}/v1/videos",
-        headers={"Authorization": f"Bearer {_require_api_key()}"},
+        headers={"Authorization": _require_api_key()},
         data={"prompt": prompt, "model": VIDEO_MODEL},
         files={"input_reference": (image_file.name, image_file.getvalue(), image_file.type or "image/png")},
         timeout=60,
     )
-    create_resp.raise_for_status()
-    video_id = create_resp.json().get("id")
+    if create_resp.status_code >= 400:
+        raise ValueError(create_resp.text)
+    try:
+        create_data = create_resp.json()
+    except ValueError:
+        raise ValueError(create_resp.text) from None
+    video_id = create_data.get("id")
     if not video_id:
-        raise ValueError("创建视频任务失败。")
+        raise ValueError(f"创建视频任务失败：{create_data}")
 
     status = "queued"
     for _ in range(120):
         status_resp = requests.get(
             f"{APIYI_BASE}/v1/videos/{video_id}",
-            headers={"Authorization": f"Bearer {_require_api_key()}"},
+            headers={"Authorization": _require_api_key()},
             timeout=20,
         )
-        status_resp.raise_for_status()
-        status_data = status_resp.json()
+        if status_resp.status_code >= 400:
+            raise ValueError(status_resp.text)
+        try:
+            status_data = status_resp.json()
+        except ValueError:
+            raise ValueError(status_resp.text) from None
         status = status_data.get("status")
         if status == "completed":
             break
         if status == "failed":
-            raise ValueError("视频生成失败。")
+            raise ValueError(f"视频生成失败：{status_data}")
         time.sleep(5)
 
     if status != "completed":
@@ -302,14 +306,18 @@ def _apiyi_generate_video(image_file, prompt: str) -> bytes:
 
     content_resp = requests.get(
         f"{APIYI_BASE}/v1/videos/{video_id}/content",
-        headers={"Authorization": f"Bearer {_require_api_key()}"},
+        headers={"Authorization": _require_api_key()},
         timeout=20,
     )
-    content_resp.raise_for_status()
-    content_data = content_resp.json()
+    if content_resp.status_code >= 400:
+        raise ValueError(content_resp.text)
+    try:
+        content_data = content_resp.json()
+    except ValueError:
+        raise ValueError(content_resp.text) from None
     video_url = content_data.get("url")
     if not video_url:
-        raise ValueError("未获取到视频地址。")
+        raise ValueError(f"未获取到视频地址：{content_data}")
 
     video_resp = requests.get(video_url, timeout=300)
     video_resp.raise_for_status()
@@ -341,10 +349,10 @@ st.markdown(
 st.write("")
 
 with st.sidebar:
-    st.subheader("🔐 API 与模型")
-    st.caption("API Key 已在 Streamlit Secrets 配置，不需要前台输入。")
-    st.caption("图像模型：gemini-3-pro-image-preview（固定）")
-    st.caption("视频模型：veo-3.1-fl（固定）")
+    st.subheader("🔐模型")
+    # st.caption("API Key 已在 Streamlit Secrets 配置，不需要前台输入。")
+    st.caption("图像模型：gemini-3-pro-image-preview")
+    st.caption("视频模型：veo-3.1-fl")
     response_text = st.toggle("返回文本说明", value=True)
 
     st.divider()
@@ -503,7 +511,6 @@ with image_gen_tab:
             with st.spinner("Nano Banana 生成图片中..."):
                 images, text, raw = _apiyi_generate_image(
                     prompt=prompt,
-                    images=None,
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
                 )
@@ -543,11 +550,11 @@ with image_edit_tab:
         if st.button("开始修图"):
             try:
                 with st.spinner("Nano Banana 修图中..."):
-                    image_data, mime_type = _file_to_base64(edit_image)
+                    if edit_aspect_ratio != "1:1":
+                        st.warning("Nano Banana Pro 4K 仅支持 1:1 方图，已忽略画幅比例。")
                     images, text, raw = _apiyi_generate_image(
                         prompt=edit_prompt,
-                        images=[(image_data, mime_type)],
-                        aspect_ratio=edit_aspect_ratio,
+                        aspect_ratio="1:1",
                         image_size=edit_image_size,
                     )
 
