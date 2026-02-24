@@ -211,33 +211,32 @@ def _apiyi_generate_image(
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
 ) -> Tuple[List[Image.Image], str, dict]:
-    endpoint = f"{APIYI_BASE}/v1/images/generations"
-    size_map = {
-        "1K": "1024x1024",
-        "2K": "2048x2048",
-        "4K": "4096x4096",
-    }
-    if aspect_ratio and aspect_ratio != "1:1":
-        raise ValueError("Nano Banana Pro 4K 仅支持 1:1 方图，请选择 1:1。")
+    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
 
     payload = {
-        "model": IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "size": size_map.get(image_size or "1K", "1024x1024"),
-        "quality": "hd",
-        "response_format": "url",
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": generation_config,
     }
 
     data = {}
     max_retries = 4
     base_delay = 1.5
+    timeout_map = {"1K": 180, "2K": 300, "4K": 360}
+    timeout = timeout_map.get(image_size or "1K", 180)
     for attempt in range(max_retries):
         response = requests.post(
             endpoint,
             headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
             json=payload,
-            timeout=180,
+            timeout=timeout,
         )
         if response.status_code in {429, 500, 503, 504} and attempt < max_retries - 1:
             retry_after = response.headers.get("Retry-After")
@@ -254,12 +253,77 @@ def _apiyi_generate_image(
 
     images_out: List[Image.Image] = []
     texts: List[str] = []
-    first = (data.get("data") or [{}])[0]
-    image_url = first.get("url")
-    if image_url:
-        img_resp = requests.get(image_url, timeout=120)
-        img_resp.raise_for_status()
-        images_out.append(Image.open(io.BytesIO(img_resp.content)))
+    try:
+        part = data["candidates"][0]["content"]["parts"][0]
+        inline_data = (part.get("inlineData") or part.get("inline_data") or {}).get("data")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        inline_data = None
+    if inline_data:
+        images_out.append(Image.open(io.BytesIO(base64.b64decode(inline_data))))
+    return images_out, "\n".join(texts).strip(), data
+
+
+def _apiyi_edit_image(
+    image_file,
+    prompt: str,
+    aspect_ratio: Optional[str] = None,
+    image_size: Optional[str] = None,
+) -> Tuple[List[Image.Image], str, dict]:
+    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
+    image_b64, mime_type = _file_to_base64(image_file)
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+            ]
+        }],
+        "generationConfig": generation_config,
+    }
+
+    data = {}
+    max_retries = 4
+    base_delay = 1.5
+    timeout_map = {"1K": 180, "2K": 300, "4K": 360}
+    timeout = timeout_map.get(image_size or "1K", 180)
+    for attempt in range(max_retries):
+        response = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout,
+        )
+        if response.status_code in {429, 500, 503, 504} and attempt < max_retries - 1:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                sleep_for = float(retry_after)
+            else:
+                sleep_for = base_delay * (2 ** attempt) + random.uniform(0, 0.7)
+            time.sleep(min(sleep_for, 12))
+            continue
+        if response.status_code >= 400:
+            raise ValueError(response.text)
+        data = response.json()
+        break
+
+    images_out: List[Image.Image] = []
+    texts: List[str] = []
+    try:
+        part = data["candidates"][0]["content"]["parts"][0]
+        inline_data = (part.get("inlineData") or part.get("inline_data") or {}).get("data")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        inline_data = None
+    if inline_data:
+        images_out.append(Image.open(io.BytesIO(base64.b64decode(inline_data))))
     return images_out, "\n".join(texts).strip(), data
 
 
@@ -550,11 +614,10 @@ with image_edit_tab:
         if st.button("开始修图"):
             try:
                 with st.spinner("Nano Banana 修图中..."):
-                    if edit_aspect_ratio != "1:1":
-                        st.warning("Nano Banana Pro 4K 仅支持 1:1 方图，已忽略画幅比例。")
-                    images, text, raw = _apiyi_generate_image(
+                    images, text, raw = _apiyi_edit_image(
+                        edit_image,
                         prompt=edit_prompt,
-                        aspect_ratio="1:1",
+                        aspect_ratio=edit_aspect_ratio,
                         image_size=edit_image_size,
                     )
 
