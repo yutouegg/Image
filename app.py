@@ -194,31 +194,54 @@ def _file_to_base64(uploaded_file) -> Tuple[str, str]:
     return base64.b64encode(data).decode("utf-8"), mime_type
 
 
-def _backend_generate_image(
-    endpoint: str,
-    model: str,
+APIYI_BASE = "https://api.apiyi.com"
+IMAGE_MODEL = "gemini-3-pro-image-preview"
+VIDEO_MODEL = "veo-3.1-fl"
+
+
+def _require_api_key() -> str:
+    key = st.secrets.get("APIYI_API_KEY")
+    if not key:
+        raise ValueError("缺少 APIYI_API_KEY，请在 Streamlit Secrets 中配置。")
+    return key
+
+
+def _apiyi_generate_image(
     prompt: str,
     images: Optional[List[Tuple[str, str]]] = None,
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
 ) -> Tuple[List[Image.Image], str, dict]:
-    payload = {
-        "prompt": prompt,
-        "model": model,
-        "aspect_ratio": aspect_ratio or "",
-        "image_size": image_size or "",
-    }
+    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config: Dict[str, str] = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
 
-    files = None
+    parts: List[Dict[str, Dict[str, str]]] = [{"text": prompt}]
     if images:
         data, mime_type = images[0]
-        files = {"image": ("edit.png", base64.b64decode(data), mime_type)}
+        parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": generation_config,
+    }
 
     data = {}
     max_retries = 4
     base_delay = 1.5
     for attempt in range(max_retries):
-        response = requests.post(endpoint, data=payload, files=files, timeout=180)
+        response = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=180,
+        )
         if response.status_code in {429, 500, 503, 504} and attempt < max_retries - 1:
             retry_after = response.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
@@ -233,7 +256,6 @@ def _backend_generate_image(
 
     images_out: List[Image.Image] = []
     texts: List[str] = []
-
     for candidate in data.get("candidates", []):
         content = candidate.get("content", {})
         for part in content.get("parts", []):
@@ -246,18 +268,52 @@ def _backend_generate_image(
     return images_out, "\n".join(texts).strip(), data
 
 
-def _backend_list_models(model_type: str) -> List[str]:
-    try:
-        resp = requests.get(
-            "http://localhost:8000/list_models",
-            params={"model_type": model_type},
+def _apiyi_generate_video(image_file, prompt: str) -> bytes:
+    create_resp = requests.post(
+        f"{APIYI_BASE}/v1/videos",
+        headers={"Authorization": f"Bearer {_require_api_key()}"},
+        data={"prompt": prompt, "model": VIDEO_MODEL},
+        files={"input_reference": (image_file.name, image_file.getvalue(), image_file.type or "image/png")},
+        timeout=60,
+    )
+    create_resp.raise_for_status()
+    video_id = create_resp.json().get("id")
+    if not video_id:
+        raise ValueError("创建视频任务失败。")
+
+    status = "queued"
+    for _ in range(120):
+        status_resp = requests.get(
+            f"{APIYI_BASE}/v1/videos/{video_id}",
+            headers={"Authorization": f"Bearer {_require_api_key()}"},
             timeout=20,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("models", [])
-    except Exception:
-        return []
+        status_resp.raise_for_status()
+        status_data = status_resp.json()
+        status = status_data.get("status")
+        if status == "completed":
+            break
+        if status == "failed":
+            raise ValueError("视频生成失败。")
+        time.sleep(5)
+
+    if status != "completed":
+        raise ValueError("视频生成超时。")
+
+    content_resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}/content",
+        headers={"Authorization": f"Bearer {_require_api_key()}"},
+        timeout=20,
+    )
+    content_resp.raise_for_status()
+    content_data = content_resp.json()
+    video_url = content_data.get("url")
+    if not video_url:
+        raise ValueError("未获取到视频地址。")
+
+    video_resp = requests.get(video_url, timeout=300)
+    video_resp.raise_for_status()
+    return video_resp.content
 
 
 _inject_style()
@@ -286,26 +342,9 @@ st.write("")
 
 with st.sidebar:
     st.subheader("🔐 API 与模型")
-    st.caption("API Key 已在服务端配置，不需要前台输入。")
-    if "model_options" not in st.session_state:
-        st.session_state["model_options"] = _backend_list_models("image") or [
-            "gemini-2.5-flash-image",
-            "gemini-3-pro-image-preview",
-        ]
-
-    if st.button("刷新模型列表"):
-        models = _backend_list_models("image")
-        if models:
-            st.session_state["model_options"] = models
-            st.success(f"已加载 {len(models)} 个图片模型。")
-        else:
-            st.warning("未发现模型或后端不可用，已保留默认列表。")
-
-    model = st.selectbox(
-        "Nano Banana 模型",
-        st.session_state["model_options"],
-        help="Flash 更快，Pro 更强细节与文字控制",
-    )
+    st.caption("API Key 已在 Streamlit Secrets 配置，不需要前台输入。")
+    st.caption("图像模型：gemini-3-pro-image-preview（固定）")
+    st.caption("视频模型：veo-3.1-fl（固定）")
     response_text = st.toggle("返回文本说明", value=True)
 
     st.divider()
@@ -403,7 +442,7 @@ video_tab, image_gen_tab, image_edit_tab = st.tabs([
 with video_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("图生视频 - 用于产品运镜")
-    st.caption("Nano Banana 仅提供图片生成；图生视频需要接入 Veo 或其他视频模型。此处提供可直接对接后端的视频生成入口。")
+    st.caption("图生视频由 API易 Veo 模型生成（固定 veo-3.1-fl）。")
 
     video_prompt = st.text_area(
         "视频提示词",
@@ -412,47 +451,22 @@ with video_tab:
     )
     video_duration = st.selectbox("视频时长 (秒)", [8], index=0)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
-    video_model_options = _backend_list_models("video") or [
-        "veo-3.1",
-        "veo-3.1-fast",
-        "veo-3.1-landscape",
-    ]
-    video_models = st.multiselect(
-        "输出版本 (模型变体)",
-        video_model_options,
-        default=[video_model_options[0]],
-        help="Veo 3.1 变体决定横竖屏与速度，若选择 landscape 则为横屏 16:9。",
-    )
-
     if st.button("生成运镜视频 (调用后端)"):
         if not product_images:
             st.error("请先上传至少一张产品图片。")
         else:
-            if not video_models:
-                st.warning("请至少选择一个模型版本。")
-            else:
-                st.session_state["last_video_versions"] = {}
-                with st.spinner("后端生成视频中..."):
-                    for model_name in video_models:
-                        final_prompt = (
-                            f"{video_prompt}\n"
-                            f"Aspect ratio: {video_ratio}\n"
-                            f"Duration: {video_duration}s"
-                        )
-                        response = requests.post(
-                            "http://localhost:8000/generate_video",
-                            files={"image": product_images[0]},
-                            data={
-                                "prompt": final_prompt,
-                                "model": model_name,
-                            },
-                            timeout=300,
-                        )
-
-                        if response.status_code == 200:
-                            st.session_state["last_video_versions"][model_name] = response.content
-                        else:
-                            st.error(f"{model_name} 版本生成失败，请检查后端日志。")
+            st.session_state["last_video_versions"] = {}
+            with st.spinner("视频生成中..."):
+                final_prompt = (
+                    f"{video_prompt}\n"
+                    f"Aspect ratio: {video_ratio}\n"
+                    f"Duration: {video_duration}s"
+                )
+                try:
+                    video_bytes = _apiyi_generate_video(product_images[0], final_prompt)
+                    st.session_state["last_video_versions"]["veo-3.1-fl"] = video_bytes
+                except Exception as exc:
+                    st.error(f"视频生成失败：{exc}")
 
     if "last_video_versions" in st.session_state and st.session_state["last_video_versions"]:
         st.markdown("**高清下载**")
@@ -483,9 +497,7 @@ with image_gen_tab:
     if st.button("生成图片"):
         try:
             with st.spinner("Nano Banana 生成图片中..."):
-                images, text, raw = _backend_generate_image(
-                    endpoint="http://localhost:8000/image_generate",
-                    model=model,
+                images, text, raw = _apiyi_generate_image(
                     prompt=prompt,
                     images=None,
                     aspect_ratio=aspect_ratio,
@@ -524,9 +536,7 @@ with image_edit_tab:
             try:
                 with st.spinner("Nano Banana 修图中..."):
                     image_data, mime_type = _file_to_base64(edit_image)
-                    images, text, raw = _backend_generate_image(
-                        endpoint="http://localhost:8000/image_edit",
-                        model=model,
+                    images, text, raw = _apiyi_generate_image(
                         prompt=edit_prompt,
                         images=[(image_data, mime_type)],
                         aspect_ratio=edit_aspect_ratio,

@@ -1,9 +1,8 @@
 import base64
 import io
 import os
-import re
 import time
-from typing import Dict, List, Optional
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile
@@ -14,40 +13,8 @@ app = FastAPI()
 APIYI_BASE = os.getenv("APIYI_BASE", "https://api.apiyi.com")
 APIYI_API_KEY = os.getenv("APIYI_API_KEY")
 
-
-IMAGE_MODEL_ALLOWLIST = [
-    "gemini-3-pro-image-preview",  # Nano Banana Pro
-    "gemini-2.5-flash-image",      # Nano Banana (正式版)
-    "gpt-image-1.5",
-    "gpt-4o-image",
-    "dall-e-3",
-    "sora_image",
-    "seedream-4-5-251128",
-    "seedream-4-0-250828",
-    "flux-kontext-pro",
-    "flux-kontext-max",
-]
-
-IMAGE_EDIT_ALLOWLIST = [
-    "gemini-3-pro-image-preview",
-    "gemini-2.5-flash-image",
-    "gpt-image-1.5",
-    "gpt-4o-image",
-    "seedream-4-5-251128",
-    "flux-kontext-pro",
-    "flux-kontext-max",
-]
-
-VIDEO_MODEL_ALLOWLIST = [
-    "veo-3.1-fl",
-    "veo-3.1-fast-fl",
-    "veo-3.1-landscape-fl",
-    "veo-3.1-landscape-fast-fl",
-    "veo-3.1",
-    "veo-3.1-fast",
-    "veo-3.1-landscape",
-    "veo-3.1-landscape-fast",
-]
+IMAGE_MODEL = "gemini-3-pro-image-preview"
+VIDEO_MODEL = "veo-3.1-fl"
 
 
 def _require_api_key() -> str:
@@ -56,53 +23,23 @@ def _require_api_key() -> str:
     return APIYI_API_KEY
 
 
-def _filter_models(models: List[Dict], allowlist: List[str]) -> List[str]:
-    model_ids = []
-    for m in models:
-        model_id = m.get("id")
-        if model_id in allowlist:
-            model_ids.append(model_id)
-    return sorted(set(model_ids), key=lambda x: allowlist.index(x) if x in allowlist else 999)
-
-
-def _list_models() -> List[Dict]:
-    key = _require_api_key()
-    resp = requests.get(
-        f"{APIYI_BASE}/v1/models",
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data", [])
-
-
 def _extract_video_url(text: str) -> Optional[str]:
     if not text:
         return None
-    match = re.search(r"https?://\\S+\\.mp4", text)
-    return match.group(0) if match else None
-
-
-@app.get("/list_models")
-async def list_models(model_type: str = "image"):
-    models = _list_models()
-    if model_type == "video":
-        return JSONResponse({"models": _filter_models(models, VIDEO_MODEL_ALLOWLIST)})
-    if model_type == "image_edit":
-        return JSONResponse({"models": _filter_models(models, IMAGE_EDIT_ALLOWLIST)})
-    return JSONResponse({"models": _filter_models(models, IMAGE_MODEL_ALLOWLIST)})
+    for token in text.split():
+        if token.startswith("http") and token.endswith(".mp4"):
+            return token
+    return None
 
 
 @app.post("/image_generate")
 async def image_generate(
     prompt: str = Form(...),
-    model: str = Form(...),
     aspect_ratio: Optional[str] = Form(None),
     image_size: Optional[str] = Form(None),
 ):
     key = _require_api_key()
-    endpoint = f"{APIYI_BASE}/v1beta/models/{model}:generateContent"
+    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
     generation_config = {"responseModalities": ["IMAGE"]}
     image_config = {}
     if aspect_ratio:
@@ -130,7 +67,6 @@ async def image_generate(
 async def image_edit(
     image: UploadFile = File(...),
     prompt: str = Form(...),
-    model: str = Form(...),
     aspect_ratio: Optional[str] = Form(None),
     image_size: Optional[str] = Form(None),
 ):
@@ -139,7 +75,7 @@ async def image_edit(
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime_type = image.content_type or "image/png"
 
-    endpoint = f"{APIYI_BASE}/v1beta/models/{model}:generateContent"
+    endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
     generation_config = {"responseModalities": ["IMAGE"]}
     image_config = {}
     if aspect_ratio:
@@ -172,19 +108,13 @@ async def image_edit(
 async def generate_video(
     image: UploadFile = File(...),
     prompt: str = Form(...),
-    model: str = Form("veo-3.1"),
 ):
     key = _require_api_key()
     image_bytes = await image.read()
-    if not model.endswith("-fl"):
-        candidate = f"{model}-fl"
-        if candidate in VIDEO_MODEL_ALLOWLIST:
-            model = candidate
-
     create_resp = requests.post(
         f"{APIYI_BASE}/v1/videos",
         headers={"Authorization": key},
-        data={"prompt": prompt, "model": model},
+        data={"prompt": prompt, "model": VIDEO_MODEL},
         files={"input_reference": (image.filename, image_bytes, image.content_type or "image/png")},
         timeout=60,
     )
@@ -228,5 +158,5 @@ async def generate_video(
     return StreamingResponse(
         io.BytesIO(video_resp.content),
         media_type="video/mp4",
-        headers={"X-Video-Model": model},
+        headers={"X-Video-Model": VIDEO_MODEL},
     )
