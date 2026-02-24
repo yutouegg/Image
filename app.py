@@ -228,7 +228,7 @@ def _apiyi_generate_image(
         parts.append({"inline_data": {"mime_type": mime_type, "data": data}})
 
     payload = {
-        "contents": [{"parts": parts}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": generation_config,
     }
 
@@ -451,7 +451,7 @@ with video_tab:
     )
     video_duration = st.selectbox("视频时长 (秒)", [8], index=0)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
-    if st.button("生成运镜视频 (调用后端)"):
+    if st.button("生成运镜视频"):
         if not product_images:
             st.error("请先上传至少一张产品图片。")
         else:
@@ -485,7 +485,11 @@ with image_gen_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("文生图 - 海报 / 场景 / 视觉资产")
 
-    aspect_ratio = st.selectbox("画幅比例", ["1:1", "4:5", "3:4", "16:9"], index=1)
+    aspect_ratio = st.selectbox(
+        "画幅比例",
+        ["1:1", "4:5", "3:4", "2:3", "5:4", "4:3", "3:2", "16:9", "9:16", "21:9"],
+        index=1,
+    )
     image_size = st.selectbox("输出尺寸 (Pro 可用)", ["1K", "2K", "4K"], index=1)
 
     prompt = st.text_area(
@@ -529,7 +533,11 @@ with image_edit_tab:
             "保留产品主体不变，背景换成浅灰色高端摄影棚，加入微弱体积光和柔和阴影。",
             height=120,
         )
-        edit_aspect_ratio = st.selectbox("画幅比例", ["1:1", "4:5", "3:4", "16:9"], index=0)
+        edit_aspect_ratio = st.selectbox(
+            "画幅比例",
+            ["1:1", "4:5", "3:4", "2:3", "5:4", "4:3", "3:2", "16:9", "9:16", "21:9"],
+            index=0,
+        )
         edit_image_size = st.selectbox("输出尺寸 (Pro 可用)", ["1K", "2K", "4K"], index=1, key="edit_size")
 
         if st.button("开始修图"):
