@@ -194,60 +194,31 @@ def _file_to_base64(uploaded_file) -> Tuple[str, str]:
     return base64.b64encode(data).decode("utf-8"), mime_type
 
 
-def _gemini_generate_image(
-    api_key: str,
+def _backend_generate_image(
+    endpoint: str,
     model: str,
     prompt: str,
     images: Optional[List[Tuple[str, str]]] = None,
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
-    return_text: bool = True,
 ) -> Tuple[List[Image.Image], str, dict]:
-    if not api_key:
-        raise ValueError("需要提供 Gemini API Key")
-
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    headers = {
-        "x-goog-api-key": api_key,
-        "Content-Type": "application/json",
-    }
-
-    parts = [{"text": prompt}]
-    if images:
-        for data, mime_type in images:
-            parts.append({
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": data,
-                }
-            })
-
-    generation_config = {}
-    response_modalities = ["Image"] if not return_text else ["Text", "Image"]
-    generation_config["responseModalities"] = response_modalities
-
-    image_config = {}
-    if aspect_ratio:
-        image_config["aspectRatio"] = aspect_ratio
-    if image_size and model == "gemini-3-pro-image-preview":
-        image_config["imageSize"] = image_size
-    if image_config:
-        generation_config["imageConfig"] = image_config
-
     payload = {
-        "contents": [
-            {
-                "parts": parts,
-            }
-        ],
-        "generationConfig": generation_config,
+        "prompt": prompt,
+        "model": model,
+        "aspect_ratio": aspect_ratio or "",
+        "image_size": image_size or "",
     }
+
+    files = None
+    if images:
+        data, mime_type = images[0]
+        files = {"image": ("edit.png", base64.b64decode(data), mime_type)}
 
     data = {}
     max_retries = 4
     base_delay = 1.5
     for attempt in range(max_retries):
-        response = requests.post(endpoint, headers=headers, data=json.dumps(payload), timeout=120)
+        response = requests.post(endpoint, data=payload, files=files, timeout=180)
         if response.status_code in {429, 500, 503, 504} and attempt < max_retries - 1:
             retry_after = response.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
@@ -275,38 +246,18 @@ def _gemini_generate_image(
     return images_out, "\n".join(texts).strip(), data
 
 
-def _list_gemini_models(api_key: str) -> List[dict]:
-    if not api_key:
+def _backend_list_models(model_type: str) -> List[str]:
+    try:
+        resp = requests.get(
+            "http://localhost:8000/list_models",
+            params={"model_type": model_type},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("models", [])
+    except Exception:
         return []
-    endpoint = "https://generativelanguage.googleapis.com/v1beta/models"
-    headers = {"x-goog-api-key": api_key}
-    params = {"pageSize": 200}
-    response = requests.get(endpoint, headers=headers, params=params, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("models", [])
-
-
-def _extract_model_id(model_obj: dict) -> str:
-    base_model = model_obj.get("baseModelId")
-    if base_model:
-        return base_model
-    name = model_obj.get("name", "")
-    if name.startswith("models/"):
-        return name.split("/", 1)[1]
-    return name
-
-
-def _filter_image_models(models: List[dict]) -> List[str]:
-    image_like = []
-    for model in models:
-        model_id = _extract_model_id(model)
-        display_name = (model.get("displayName") or "").lower()
-        if not model_id:
-            continue
-        if "image" in model_id or "imagen" in model_id or "image" in display_name:
-            image_like.append(model_id)
-    return sorted(set(image_like))
 
 
 _inject_style()
@@ -335,45 +286,24 @@ st.write("")
 
 with st.sidebar:
     st.subheader("🔐 API 与模型")
-    api_key = st.text_input("Gemini API Key", type="password", placeholder="GEMINI_API_KEY")
-    st.caption("Nano Banana 对应 Gemini 图片模型（官方示例为 gemini-2.5-flash-image / gemini-3-pro-image-preview）。")
+    st.caption("API Key 已在服务端配置，不需要前台输入。")
     if "model_options" not in st.session_state:
-        st.session_state["model_options"] = [
+        st.session_state["model_options"] = _backend_list_models("image") or [
             "gemini-2.5-flash-image",
             "gemini-3-pro-image-preview",
         ]
 
-    col_refresh, col_toggle = st.columns([1, 1])
-    with col_refresh:
-        if st.button("刷新模型列表"):
-            if not api_key:
-                st.warning("请先输入 API Key。")
-            else:
-                try:
-                    models = _list_gemini_models(api_key)
-                    image_models = _filter_image_models(models)
-                    if image_models:
-                        st.session_state["model_options"] = image_models
-                        st.success(f"已加载 {len(image_models)} 个图片模型。")
-                    else:
-                        st.warning("未发现图片模型，已保留默认列表。")
-                except Exception as exc:
-                    st.error(f"获取模型列表失败：{exc}")
-
-    show_all_models = st.checkbox("显示所有模型（高级）", value=False)
-    model_options = st.session_state["model_options"]
-    if show_all_models and api_key:
-        try:
-            models = _list_gemini_models(api_key)
-            all_models = sorted({_extract_model_id(m) for m in models if _extract_model_id(m)})
-            if all_models:
-                model_options = all_models
-        except Exception:
-            pass
+    if st.button("刷新模型列表"):
+        models = _backend_list_models("image")
+        if models:
+            st.session_state["model_options"] = models
+            st.success(f"已加载 {len(models)} 个图片模型。")
+        else:
+            st.warning("未发现模型或后端不可用，已保留默认列表。")
 
     model = st.selectbox(
         "Nano Banana 模型",
-        model_options,
+        st.session_state["model_options"],
         help="Flash 更快，Pro 更强细节与文字控制",
     )
     response_text = st.toggle("返回文本说明", value=True)
@@ -480,59 +410,58 @@ with video_tab:
         "拍摄一瓶高端香氛，镜头从瓶身logo缓慢推近，浅景深，微微旋转，背景柔和灯带。",
         height=120,
     )
-    video_duration = st.selectbox("视频时长 (秒)", [4, 6, 8], index=1)
+    video_duration = st.selectbox("视频时长 (秒)", [8], index=0)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
-    video_resolutions = st.multiselect(
-        "输出版本 (清晰度)",
-        ["720p", "1080p"],
-        default=["1080p"],
-        help="可多选生成不同清晰度版本，适配淘宝/亚马逊素材要求。",
+    video_model_options = _backend_list_models("video") or [
+        "veo-3.1",
+        "veo-3.1-fast",
+        "veo-3.1-landscape",
+    ]
+    video_models = st.multiselect(
+        "输出版本 (模型变体)",
+        video_model_options,
+        default=[video_model_options[0]],
+        help="Veo 3.1 变体决定横竖屏与速度，若选择 landscape 则为横屏 16:9。",
     )
-    video_model = st.selectbox(
-        "视频模型",
-        ["veo-3.1-generate-preview", "veo-3.0-fast-generate-preview"],
-    )
-    generate_audio = st.toggle("生成音轨 (Veo 3 要求)", value=True)
-    enhance_prompt = st.toggle("自动增强提示词", value=True)
 
     if st.button("生成运镜视频 (调用后端)"):
         if not product_images:
             st.error("请先上传至少一张产品图片。")
         else:
-            if not video_resolutions:
-                st.warning("请至少选择一个清晰度版本。")
+            if not video_models:
+                st.warning("请至少选择一个模型版本。")
             else:
                 st.session_state["last_video_versions"] = {}
                 with st.spinner("后端生成视频中..."):
-                    for resolution in video_resolutions:
+                    for model_name in video_models:
+                        final_prompt = (
+                            f"{video_prompt}\n"
+                            f"Aspect ratio: {video_ratio}\n"
+                            f"Duration: {video_duration}s"
+                        )
                         response = requests.post(
                             "http://localhost:8000/generate_video",
                             files={"image": product_images[0]},
                             data={
-                                "prompt": video_prompt,
-                                "duration": video_duration,
-                                "ratio": video_ratio,
-                                "resolution": resolution,
-                                "model": video_model,
-                                "generate_audio": generate_audio,
-                                "enhance_prompt": enhance_prompt,
+                                "prompt": final_prompt,
+                                "model": model_name,
                             },
                             timeout=300,
                         )
 
                         if response.status_code == 200:
-                            st.session_state["last_video_versions"][resolution] = response.content
+                            st.session_state["last_video_versions"][model_name] = response.content
                         else:
-                            st.error(f"{resolution} 版本生成失败，请检查后端日志。")
+                            st.error(f"{model_name} 版本生成失败，请检查后端日志。")
 
     if "last_video_versions" in st.session_state and st.session_state["last_video_versions"]:
         st.markdown("**高清下载**")
-        for resolution, video_bytes in st.session_state["last_video_versions"].items():
+        for model_name, video_bytes in st.session_state["last_video_versions"].items():
             st.video(video_bytes)
             st.download_button(
-                f"下载 {resolution} (MP4)",
+                f"下载 {model_name} (MP4)",
                 data=video_bytes,
-                file_name=f"nanobanana_video_{resolution}.mp4",
+                file_name=f"nanobanana_video_{model_name}.mp4",
                 mime="video/mp4",
             )
 
@@ -554,14 +483,13 @@ with image_gen_tab:
     if st.button("生成图片"):
         try:
             with st.spinner("Nano Banana 生成图片中..."):
-                images, text, raw = _gemini_generate_image(
-                    api_key=api_key,
+                images, text, raw = _backend_generate_image(
+                    endpoint="http://localhost:8000/image_generate",
                     model=model,
                     prompt=prompt,
                     images=None,
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
-                    return_text=response_text,
                 )
 
             if text:
@@ -596,14 +524,13 @@ with image_edit_tab:
             try:
                 with st.spinner("Nano Banana 修图中..."):
                     image_data, mime_type = _file_to_base64(edit_image)
-                    images, text, raw = _gemini_generate_image(
-                        api_key=api_key,
+                    images, text, raw = _backend_generate_image(
+                        endpoint="http://localhost:8000/image_edit",
                         model=model,
                         prompt=edit_prompt,
                         images=[(image_data, mime_type)],
                         aspect_ratio=edit_aspect_ratio,
                         image_size=edit_image_size,
-                        return_text=response_text,
                     )
 
                 if text:

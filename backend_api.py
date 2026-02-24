@@ -1,111 +1,232 @@
+import base64
 import io
-import mimetypes
 import os
-import tempfile
+import re
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import StreamingResponse
-from google import genai
-from google.genai import types
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
 
-
-def _get_genai_client(api_key: Optional[str] = None) -> genai.Client:
-
-    resolved_key = 'AIzaSyCsb9lMQ68Ns0MCfhdZXnWk6FTRfcc4jBw'
-    if not resolved_key:
-        raise ValueError("缺少 GEMINI_API_KEY/GOOGLE_API_KEY，无法调用 Veo")
-    return genai.Client(api_key=resolved_key)
+APIYI_BASE = os.getenv("APIYI_BASE", "https://api.apiyi.com")
+APIYI_API_KEY = os.getenv("APIYI_API_KEY")
 
 
-def _upload_to_types_image(image_bytes: bytes, mime_type: str) -> types.Image:
-    suffix = mimetypes.guess_extension(mime_type or "") or ".png"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(image_bytes)
-        tmp_path = tmp.name
-    try:
-        return types.Image.from_file(tmp_path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+IMAGE_MODEL_ALLOWLIST = [
+    "gemini-3-pro-image-preview",  # Nano Banana Pro
+    "gemini-2.5-flash-image",      # Nano Banana (正式版)
+    "gpt-image-1.5",
+    "gpt-4o-image",
+    "dall-e-3",
+    "sora_image",
+    "seedream-4-5-251128",
+    "seedream-4-0-250828",
+    "flux-kontext-pro",
+    "flux-kontext-max",
+]
+
+IMAGE_EDIT_ALLOWLIST = [
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+    "gpt-image-1.5",
+    "gpt-4o-image",
+    "seedream-4-5-251128",
+    "flux-kontext-pro",
+    "flux-kontext-max",
+]
+
+VIDEO_MODEL_ALLOWLIST = [
+    "veo-3.1-fl",
+    "veo-3.1-fast-fl",
+    "veo-3.1-landscape-fl",
+    "veo-3.1-landscape-fast-fl",
+    "veo-3.1",
+    "veo-3.1-fast",
+    "veo-3.1-landscape",
+    "veo-3.1-landscape-fast",
+]
 
 
-def _download_video_bytes(video: types.Video, api_key: str) -> bytes:
-    if getattr(video, "video_bytes", None):
-        return video.video_bytes
-    if getattr(video, "uri", None):
-        resp = requests.get(
-            video.uri,
-            headers={"x-goog-api-key": api_key},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        return resp.content
-    raise ValueError("Veo 未返回视频内容。")
+def _require_api_key() -> str:
+    if not APIYI_API_KEY:
+        raise ValueError("缺少 APIYI_API_KEY，请在服务端环境变量中配置。")
+    return APIYI_API_KEY
+
+
+def _filter_models(models: List[Dict], allowlist: List[str]) -> List[str]:
+    model_ids = []
+    for m in models:
+        model_id = m.get("id")
+        if model_id in allowlist:
+            model_ids.append(model_id)
+    return sorted(set(model_ids), key=lambda x: allowlist.index(x) if x in allowlist else 999)
+
+
+def _list_models() -> List[Dict]:
+    key = _require_api_key()
+    resp = requests.get(
+        f"{APIYI_BASE}/v1/models",
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", [])
+
+
+def _extract_video_url(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(r"https?://\\S+\\.mp4", text)
+    return match.group(0) if match else None
+
+
+@app.get("/list_models")
+async def list_models(model_type: str = "image"):
+    models = _list_models()
+    if model_type == "video":
+        return JSONResponse({"models": _filter_models(models, VIDEO_MODEL_ALLOWLIST)})
+    if model_type == "image_edit":
+        return JSONResponse({"models": _filter_models(models, IMAGE_EDIT_ALLOWLIST)})
+    return JSONResponse({"models": _filter_models(models, IMAGE_MODEL_ALLOWLIST)})
+
+
+@app.post("/image_generate")
+async def image_generate(
+    prompt: str = Form(...),
+    model: str = Form(...),
+    aspect_ratio: Optional[str] = Form(None),
+    image_size: Optional[str] = Form(None),
+):
+    key = _require_api_key()
+    endpoint = f"{APIYI_BASE}/v1beta/models/{model}:generateContent"
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": generation_config,
+    }
+    resp = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return JSONResponse(resp.json())
+
+
+@app.post("/image_edit")
+async def image_edit(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form(...),
+    aspect_ratio: Optional[str] = Form(None),
+    image_size: Optional[str] = Form(None),
+):
+    key = _require_api_key()
+    image_bytes = await image.read()
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = image.content_type or "image/png"
+
+    endpoint = f"{APIYI_BASE}/v1beta/models/{model}:generateContent"
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_config["imageSize"] = image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64}},
+            ]
+        }],
+        "generationConfig": generation_config,
+    }
+    resp = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=360,
+    )
+    resp.raise_for_status()
+    return JSONResponse(resp.json())
 
 
 @app.post("/generate_video")
 async def generate_video(
     image: UploadFile = File(...),
     prompt: str = Form(...),
-    duration: int = Form(...),
-    ratio: str = Form(...),
-    resolution: Optional[str] = Form(None),
-    model: str = Form("veo-3.1-generate-preview"),
-    generate_audio: bool = Form(True),
-    enhance_prompt: bool = Form(True),
-    api_key: Optional[str] = Form(None),
+    model: str = Form("veo-3.1"),
 ):
+    key = _require_api_key()
     image_bytes = await image.read()
-    mime_type = image.content_type or "image/png"
+    if not model.endswith("-fl"):
+        candidate = f"{model}-fl"
+        if candidate in VIDEO_MODEL_ALLOWLIST:
+            model = candidate
 
-    client = _get_genai_client(api_key)
-    gen_image = _upload_to_types_image(image_bytes, mime_type)
-
-    config_kwargs = {
-        "number_of_videos": 1,
-        "duration_seconds": duration,
-        "aspect_ratio": ratio,
-        "generate_audio": generate_audio,
-        "enhance_prompt": enhance_prompt,
-    }
-    if resolution:
-        config_kwargs["resolution"] = resolution
-
-    operation = client.models.generate_videos(
-        model=model,
-        prompt=prompt,
-        image=gen_image,
-        config=types.GenerateVideosConfig(**config_kwargs),
+    create_resp = requests.post(
+        f"{APIYI_BASE}/v1/videos",
+        headers={"Authorization": key},
+        data={"prompt": prompt, "model": model},
+        files={"input_reference": (image.filename, image_bytes, image.content_type or "image/png")},
+        timeout=60,
     )
+    create_resp.raise_for_status()
+    video_id = create_resp.json().get("id")
+    if not video_id:
+        return JSONResponse({"error": "创建视频任务失败", "raw": create_resp.json()}, status_code=502)
 
-    while not operation.done:
-        time.sleep(10)
-        operation = client.operations.get(operation)
+    status = "queued"
+    for _ in range(120):
+        status_resp = requests.get(
+            f"{APIYI_BASE}/v1/videos/{video_id}",
+            headers={"Authorization": key},
+            timeout=20,
+        )
+        status_resp.raise_for_status()
+        status_data = status_resp.json()
+        status = status_data.get("status")
+        if status == "completed":
+            break
+        if status == "failed":
+            return JSONResponse({"error": "视频生成失败", "raw": status_data}, status_code=502)
+        time.sleep(5)
 
-    response = getattr(operation, "response", None) or getattr(operation, "result", None)
-    generated_videos = getattr(response, "generated_videos", None) if response else None
-    if not generated_videos and isinstance(response, dict):
-        generated_videos = response.get("videos")
+    if status != "completed":
+        return JSONResponse({"error": "视频生成超时", "video_id": video_id}, status_code=504)
 
-    if not generated_videos:
-        raise ValueError("Veo 未返回生成结果。")
+    content_resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}/content",
+        headers={"Authorization": key},
+        timeout=20,
+    )
+    content_resp.raise_for_status()
+    content_data = content_resp.json()
+    video_url = content_data.get("url") or _extract_video_url(str(content_data))
+    if not video_url:
+        return JSONResponse({"error": "未获取到视频地址", "raw": content_data}, status_code=502)
 
-    first_video = generated_videos[0]
-    video = getattr(first_video, "video", None) or first_video
-    video_bytes = _download_video_bytes(video, api_key or os.getenv("GEMINI_API_KEY") or "")
-
+    video_resp = requests.get(video_url, timeout=300)
+    video_resp.raise_for_status()
     return StreamingResponse(
-        io.BytesIO(video_bytes),
+        io.BytesIO(video_resp.content),
         media_type="video/mp4",
-        headers={
-            "X-Video-Model": model,
-            "X-Video-Resolution": resolution or "default",
-        },
+        headers={"X-Video-Model": model},
     )
