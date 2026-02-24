@@ -281,15 +281,20 @@ def _apiyi_generate_image(
 
 
 def _apiyi_edit_image(
-    image_file,
+    image_files: List,
     prompt: str,
     aspect_ratio: Optional[str] = None,
     image_size: Optional[str] = None,
 ) -> Tuple[List[Image.Image], str, dict]:
     endpoint = f"{APIYI_BASE}/v1beta/models/{IMAGE_MODEL}:generateContent"
-    image_b64, mime_type = _file_to_base64(image_file)
-    if not image_b64:
-        raise ValueError("上传图片为空或无法读取，请重新上传后再试。")
+    if not image_files:
+        raise ValueError("请至少选择一张图片进行编辑。")
+    parts = [{"text": prompt}]
+    for image_file in image_files:
+        image_b64, mime_type = _file_to_base64(image_file)
+        if not image_b64:
+            raise ValueError("上传图片为空或无法读取，请重新上传后再试。")
+        parts.append({"inline_data": {"mime_type": mime_type, "data": image_b64}})
     generation_config = {"responseModalities": ["IMAGE"]}
     image_config = {}
     if aspect_ratio:
@@ -301,10 +306,7 @@ def _apiyi_edit_image(
 
     payload = {
         "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": image_b64}},
-            ]
+            "parts": parts
         }],
         "generationConfig": generation_config,
     }
@@ -617,7 +619,12 @@ with image_edit_tab:
     if not product_images:
         st.info("请在侧边栏上传产品图片后再开始编辑。")
     else:
-        edit_image = st.selectbox("选择要编辑的图片", product_images, format_func=lambda f: f.name)
+        edit_images = st.multiselect(
+            "选择要编辑的图片（可多选）",
+            product_images,
+            default=product_images[:1],
+            format_func=lambda f: f.name,
+        )
         edit_prompt = st.text_area(
             "编辑指令",
             "保留产品主体不变，背景换成浅灰色高端摄影棚，加入微弱体积光和柔和阴影。",
@@ -634,7 +641,7 @@ with image_edit_tab:
             try:
                 with st.spinner("Nano Banana 修图中..."):
                     images, text, raw = _apiyi_edit_image(
-                        edit_image,
+                        edit_images,
                         prompt=edit_prompt,
                         aspect_ratio=edit_aspect_ratio,
                         image_size=edit_image_size,
