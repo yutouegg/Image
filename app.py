@@ -128,6 +128,12 @@ def _inject_style() -> None:
             border: 1px solid rgba(15, 23, 42, 0.12) !important;
         }
 
+        .stSelectbox input,
+        .stMultiSelect input {
+            caret-color: transparent !important;
+            cursor: pointer !important;
+        }
+
         .stFileUploader>div {
             background-color: rgba(255, 255, 255, 0.9);
             border-radius: 12px;
@@ -565,7 +571,7 @@ with video_tab:
         "拍摄一瓶高端香氛，镜头从瓶身logo缓慢推近，浅景深，微微旋转，背景柔和灯带。",
         height=120,
     )
-    video_duration = st.selectbox("视频时长 (秒)", [8], index=0)
+    video_duration = st.number_input("视频时长 (秒)", min_value=1, max_value=60, value=8, step=1)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
     video_refs = []
     if product_images:
