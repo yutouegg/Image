@@ -113,9 +113,16 @@ def _inject_style() -> None:
         }
 
         .stTextInput>div>div>input,
-        .stTextArea>div>textarea,
-        .stSelectbox>div>div {
-            background-color: rgba(255, 255, 255, 0.96) !important;
+        .stTextInput>div>div,
+        .stTextArea>div>div>textarea,
+        .stTextArea>div>div,
+        .stSelectbox>div>div,
+        .stSelectbox [data-baseweb="select"]>div,
+        .stSelectbox input,
+        .stMultiSelect>div>div,
+        .stMultiSelect [data-baseweb="select"]>div,
+        .stMultiSelect input {
+            background-color: #ffffff !important;
             border-radius: 10px !important;
             color: var(--text) !important;
             border: 1px solid rgba(15, 23, 42, 0.12) !important;
