@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import random
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -375,28 +376,43 @@ def _apiyi_generate_video(image_file, prompt: str) -> bytes:
 def _extract_video_url(text: str) -> Optional[str]:
     if not text:
         return None
+    match = re.search(r"https?://[^\s\)\]]+\.mp4", text)
+    if match:
+        return match.group(0)
     for token in text.split():
         if token.startswith("http") and token.endswith(".mp4"):
             return token
     return None
 
 
-def _apiyi_generate_video_multi(image_files: List, prompt: str) -> bytes:
+def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
+    is_landscape = video_ratio == "16:9"
+    use_15s = duration_s >= 13
+    if is_landscape:
+        return "sora_video2-landscape-15s" if use_15s else "sora_video2-landscape"
+    return "sora_video2-15s" if use_15s else "sora_video2"
+
+
+def _apiyi_generate_video_multi(
+    image_files: List,
+    prompt: str,
+    model: str,
+) -> bytes:
     if not image_files:
         raise ValueError("请至少选择一张参考图。")
 
+    # Sora 2 图生视频仅支持 1 张参考图
+    image_file = image_files[0]
     parts = [{"type": "text", "text": prompt}]
-    for image_file in image_files:
-        data_url = _file_to_data_url(image_file)
-        if not data_url:
-            raise ValueError("参考图为空或无法读取，请重新上传后再试。")
-        parts.append({"type": "image_url", "image_url": {"url": data_url}})
+    data_url = _file_to_data_url(image_file)
+    if not data_url:
+        raise ValueError("参考图为空或无法读取，请重新上传后再试。")
+    parts.append({"type": "image_url", "image_url": {"url": data_url}})
 
     payload = {
-        "model": "sora_video2",
+        "model": model,
         "stream": True,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": parts},
         ],
     }
@@ -564,19 +580,19 @@ video_tab, image_gen_tab, image_edit_tab = st.tabs([
 with video_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("图生视频 - 用于产品运镜")
-    st.caption("图生视频由 API易 Sora 2 模型生成（固定 sora_video2）。")
+    st.caption("图生视频由 API易 Sora 2 模型生成（按画幅与时长自动选择型号）。")
 
     video_prompt = st.text_area(
         "视频提示词",
         "拍摄一瓶高端香氛，镜头从瓶身logo缓慢推近，浅景深，微微旋转，背景柔和灯带。",
         height=120,
     )
-    video_duration = st.number_input("视频时长 (秒)", min_value=1, max_value=60, value=8, step=1)
+    video_duration = st.number_input("视频时长 (秒)", min_value=1, max_value=15, value=10, step=1)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
     video_refs = []
     if product_images:
         video_refs = st.multiselect(
-            "参考图片（可多选）",
+            "参考图片（目前仅支持选择 1 张）",
             product_images,
             default=product_images[:1],
             format_func=lambda f: f.name,
@@ -597,9 +613,12 @@ with video_tab:
                 )
                 try:
                     if len(video_refs) > 1:
-                        st.info("已选择多张参考图，模型将综合参考。")
-                    video_bytes = _apiyi_generate_video_multi(video_refs, final_prompt)
-                    st.session_state["last_video_versions"][VIDEO_MODEL] = video_bytes
+                        st.info("Sora 2 图生视频当前仅支持 1 张参考图，已取第一张。")
+                    if video_duration not in (10, 15):
+                        st.info("Sora 2 仅支持 10s 或 15s，已自动匹配最近的时长配置。")
+                    model_name = _pick_sora_model(video_ratio, int(video_duration))
+                    video_bytes = _apiyi_generate_video_multi(video_refs, final_prompt, model=model_name)
+                    st.session_state["last_video_versions"][model_name] = video_bytes
                 except Exception as exc:
                     st.error(f"视频生成失败：{exc}")
 

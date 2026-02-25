@@ -2,7 +2,7 @@ import base64
 import io
 import os
 import time
-from typing import List, Optional
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile
@@ -104,32 +104,36 @@ async def image_edit(
     return JSONResponse(resp.json())
 
 
+def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
+    is_landscape = video_ratio == "16:9"
+    use_15s = duration_s >= 13
+    if is_landscape:
+        return "sora_video2-landscape-15s" if use_15s else "sora_video2-landscape"
+    return "sora_video2-15s" if use_15s else "sora_video2"
+
+
 @app.post("/generate_video")
 async def generate_video(
-    images: List[UploadFile] = File(...),
+    image: UploadFile = File(...),
     prompt: str = Form(...),
+    video_ratio: str = Form("16:9"),
+    video_duration: int = Form(10),
 ):
     key = _require_api_key()
-    if not images:
-        return JSONResponse({"error": "请至少上传一张参考图"}, status_code=400)
-
-    parts = [{"type": "text", "text": prompt}]
-    for image in images:
-        image_bytes = await image.read()
-        if not image_bytes:
-            return JSONResponse({"error": f"参考图为空: {image.filename}"}, status_code=400)
-        mime_type = image.content_type or "image/png"
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-        })
+    image_bytes = await image.read()
+    if not image_bytes:
+        return JSONResponse({"error": "参考图为空"}, status_code=400)
+    mime_type = image.content_type or "image/png"
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    parts = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+    ]
 
     payload = {
-        "model": VIDEO_MODEL,
+        "model": _pick_sora_model(video_ratio, int(video_duration)),
         "stream": True,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": parts},
         ],
     }
