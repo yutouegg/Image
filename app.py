@@ -211,9 +211,16 @@ def _file_to_base64(uploaded_file) -> Tuple[str, str]:
     return base64.b64encode(data).decode("utf-8"), mime_type
 
 
+def _file_to_data_url(uploaded_file) -> str:
+    image_b64, mime_type = _file_to_base64(uploaded_file)
+    if not image_b64:
+        return ""
+    return f"data:{mime_type};base64,{image_b64}"
+
+
 APIYI_BASE = "https://api.apiyi.com"
 IMAGE_MODEL = "gemini-3-pro-image-preview"
-VIDEO_MODEL = "veo-3.1-fl"
+VIDEO_MODEL = "sora_video2"
 
 
 def _require_api_key() -> str:
@@ -349,62 +356,71 @@ def _apiyi_edit_image(
 
 
 def _apiyi_generate_video(image_file, prompt: str) -> bytes:
-    create_resp = requests.post(
-        f"{APIYI_BASE}/v1/videos",
-        headers={"Authorization": _require_api_key()},
-        data={"prompt": prompt, "model": VIDEO_MODEL},
-        files={"input_reference": (image_file.name, image_file.getvalue(), image_file.type or "image/png")},
-        timeout=60,
-    )
-    if create_resp.status_code >= 400:
-        raise ValueError(create_resp.text)
-    try:
-        create_data = create_resp.json()
-    except ValueError:
-        raise ValueError(create_resp.text) from None
-    video_id = create_data.get("id")
-    if not video_id:
-        raise ValueError(f"创建视频任务失败：{create_data}")
+    return _apiyi_generate_video_multi([image_file], prompt)
 
-    status = "queued"
-    for _ in range(120):
-        status_resp = requests.get(
-            f"{APIYI_BASE}/v1/videos/{video_id}",
-            headers={"Authorization": _require_api_key()},
-            timeout=20,
-        )
-        if status_resp.status_code >= 400:
-            raise ValueError(status_resp.text)
-        try:
-            status_data = status_resp.json()
-        except ValueError:
-            raise ValueError(status_resp.text) from None
-        status = status_data.get("status")
-        if status == "completed":
+
+def _extract_video_url(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for token in text.split():
+        if token.startswith("http") and token.endswith(".mp4"):
+            return token
+    return None
+
+
+def _apiyi_generate_video_multi(image_files: List, prompt: str) -> bytes:
+    if not image_files:
+        raise ValueError("请至少选择一张参考图。")
+
+    parts = [{"type": "text", "text": prompt}]
+    for image_file in image_files:
+        data_url = _file_to_data_url(image_file)
+        if not data_url:
+            raise ValueError("参考图为空或无法读取，请重新上传后再试。")
+        parts.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    payload = {
+        "model": "sora_video2",
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": parts},
+        ],
+    }
+
+    resp = requests.post(
+        f"{APIYI_BASE}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=360,
+        stream=True,
+    )
+    if resp.status_code >= 400:
+        raise ValueError(resp.text)
+
+    text_chunks: List[str] = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith("data: "):
+            line = line[len("data: "):]
+        if line == "[DONE]":
             break
-        if status == "failed":
-            raise ValueError(f"视频生成失败：{status_data}")
-        time.sleep(5)
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        delta = (data.get("choices") or [{}])[0].get("delta") or {}
+        content = delta.get("content")
+        if content:
+            text_chunks.append(content)
 
-    if status != "completed":
-        raise ValueError("视频生成超时。")
-
-    content_resp = requests.get(
-        f"{APIYI_BASE}/v1/videos/{video_id}/content",
-        headers={"Authorization": _require_api_key()},
-        timeout=20,
-    )
-    if content_resp.status_code >= 400:
-        raise ValueError(content_resp.text)
-    try:
-        content_data = content_resp.json()
-    except ValueError:
-        raise ValueError(content_resp.text) from None
-    video_url = content_data.get("url")
+    full_text = "".join(text_chunks)
+    video_url = _extract_video_url(full_text)
     if not video_url:
-        raise ValueError(f"未获取到视频地址：{content_data}")
+        raise ValueError("未解析到视频地址，请重试。")
 
-    video_resp = requests.get(video_url, timeout=300)
+    video_resp = requests.get(video_url, timeout=600)
     video_resp.raise_for_status()
     return video_resp.content
 
@@ -535,7 +551,7 @@ video_tab, image_gen_tab, image_edit_tab = st.tabs([
 with video_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("图生视频 - 用于产品运镜")
-    st.caption("图生视频由 API易 Veo 模型生成（固定 veo-3.1-fl）。")
+    st.caption("图生视频由 API易 Sora 2 模型生成（固定 sora_video2）。")
 
     video_prompt = st.text_area(
         "视频提示词",
@@ -544,9 +560,20 @@ with video_tab:
     )
     video_duration = st.selectbox("视频时长 (秒)", [8], index=0)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
+    video_refs = []
+    if product_images:
+        video_refs = st.multiselect(
+            "参考图片（可多选）",
+            product_images,
+            default=product_images[:1],
+            format_func=lambda f: f.name,
+        )
+
     if st.button("生成运镜视频"):
         if not product_images:
             st.error("请先上传至少一张产品图片。")
+        elif not video_refs:
+            st.error("请选择至少一张参考图片。")
         else:
             st.session_state["last_video_versions"] = {}
             with st.spinner("视频生成中..."):
@@ -556,8 +583,10 @@ with video_tab:
                     f"Duration: {video_duration}s"
                 )
                 try:
-                    video_bytes = _apiyi_generate_video(product_images[0], final_prompt)
-                    st.session_state["last_video_versions"]["veo-3.1-fl"] = video_bytes
+                    if len(video_refs) > 1:
+                        st.info("已选择多张参考图，模型将综合参考。")
+                    video_bytes = _apiyi_generate_video_multi(video_refs, final_prompt)
+                    st.session_state["last_video_versions"][VIDEO_MODEL] = video_bytes
                 except Exception as exc:
                     st.error(f"视频生成失败：{exc}")
 
