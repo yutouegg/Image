@@ -393,6 +393,13 @@ def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
     return "sora_video2-15s" if use_15s else "sora_video2"
 
 
+def _should_retry_video_error(body: str) -> bool:
+    if not body:
+        return False
+    lower = body.lower()
+    return "heavy load" in lower or "overloaded" in lower
+
+
 def _apiyi_generate_video_multi(
     image_files: List,
     prompt: str,
@@ -417,15 +424,23 @@ def _apiyi_generate_video_multi(
         ],
     }
 
-    resp = requests.post(
-        f"{APIYI_BASE}/v1/chat/completions",
-        headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=360,
-        stream=True,
-    )
-    if resp.status_code >= 400:
-        raise ValueError(resp.text)
+    max_retries = 3
+    base_delay = 2
+    for attempt in range(max_retries):
+        resp = requests.post(
+            f"{APIYI_BASE}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=600,
+            stream=True,
+        )
+        if resp.status_code < 400:
+            break
+        body = resp.text
+        if _should_retry_video_error(body) and attempt < max_retries - 1:
+            time.sleep(base_delay * (2 ** attempt))
+            continue
+        raise ValueError(body)
 
     text_chunks: List[str] = []
     for line in resp.iter_lines(decode_unicode=True):

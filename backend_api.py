@@ -112,6 +112,13 @@ def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
     return "sora_video2-15s" if use_15s else "sora_video2"
 
 
+def _should_retry_video_error(body: str) -> bool:
+    if not body:
+        return False
+    lower = body.lower()
+    return "heavy load" in lower or "overloaded" in lower
+
+
 @app.post("/generate_video")
 async def generate_video(
     image: UploadFile = File(...),
@@ -138,15 +145,24 @@ async def generate_video(
         ],
     }
 
-    resp = requests.post(
-        f"{APIYI_BASE}/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=360,
-        stream=True,
-    )
-    if resp.status_code >= 400:
-        return JSONResponse({"error": "生成失败", "raw": resp.text}, status_code=502)
+    max_retries = 3
+    base_delay = 2
+    resp = None
+    for attempt in range(max_retries):
+        resp = requests.post(
+            f"{APIYI_BASE}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=600,
+            stream=True,
+        )
+        if resp.status_code < 400:
+            break
+        body = resp.text
+        if _should_retry_video_error(body) and attempt < max_retries - 1:
+            time.sleep(base_delay * (2 ** attempt))
+            continue
+        return JSONResponse({"error": "生成失败", "raw": body}, status_code=502)
 
     text_chunks: List[str] = []
     for line in resp.iter_lines(decode_unicode=True):
