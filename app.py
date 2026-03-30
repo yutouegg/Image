@@ -1,9 +1,7 @@
 # 项目Streamlit前端
 import base64
 import io
-import json
 import random
-import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -195,12 +193,6 @@ def _extract_text_from_file(uploaded_file) -> Tuple[str, str]:
         return "", "文档解析失败，请转换为 TXT / PDF / DOCX。"
 
 
-def _image_to_base64(image: Image.Image, mime_type: str = "image/png") -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
 def _guess_mime_type(filename: str, fallback: str = "image/png") -> str:
     if not filename:
         return fallback
@@ -225,16 +217,8 @@ def _file_to_base64(uploaded_file) -> Tuple[str, str]:
     return base64.b64encode(data).decode("utf-8"), mime_type
 
 
-def _file_to_data_url(uploaded_file) -> str:
-    image_b64, mime_type = _file_to_base64(uploaded_file)
-    if not image_b64:
-        return ""
-    return f"data:{mime_type};base64,{image_b64}"
-
-
 APIYI_BASE = "https://api.apiyi.com"
 IMAGE_MODEL = "gemini-3-pro-image-preview"
-VIDEO_MODEL = "sora_video2"
 
 
 def _require_api_key() -> str:
@@ -369,104 +353,90 @@ def _apiyi_edit_image(
     return images_out, "\n".join(texts).strip(), data
 
 
-def _apiyi_generate_video(image_file, prompt: str) -> bytes:
-    return _apiyi_generate_video_multi([image_file], prompt)
+def _pick_veo_model(video_ratio: str, use_frames: bool, use_fast: bool = False) -> str:
+    model = "veo-3.1"
+    if video_ratio == "16:9":
+        model += "-landscape"
+    if use_fast:
+        model += "-fast"
+    if use_frames:
+        model += "-fl"
+    return model
 
 
-def _extract_video_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    match = re.search(r"https?://[^\s\)\]]+\.mp4", text)
-    if match:
-        return match.group(0)
-    for token in text.split():
-        if token.startswith("http") and token.endswith(".mp4"):
-            return token
-    return None
-
-
-def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
-    is_landscape = video_ratio == "16:9"
-    use_15s = duration_s >= 13
-    if is_landscape:
-        return "sora_video2-landscape-15s" if use_15s else "sora_video2-landscape"
-    return "sora_video2-15s" if use_15s else "sora_video2"
-
-
-def _should_retry_video_error(body: str) -> bool:
-    if not body:
-        return False
-    lower = body.lower()
-    return "heavy load" in lower or "overloaded" in lower
-
-
-def _apiyi_generate_video_multi(
-    image_files: List,
-    prompt: str,
-    model: str,
-) -> bytes:
-    if not image_files:
-        raise ValueError("请至少选择一张参考图。")
-
-    # Sora 2 图生视频仅支持 1 张参考图
-    image_file = image_files[0]
-    parts = [{"type": "text", "text": prompt}]
-    data_url = _file_to_data_url(image_file)
-    if not data_url:
-        raise ValueError("参考图为空或无法读取，请重新上传后再试。")
-    parts.append({"type": "image_url", "image_url": {"url": data_url}})
-
-    payload = {
-        "model": model,
-        "stream": True,
-        "messages": [
-            {"role": "user", "content": parts},
-        ],
-    }
-
-    max_retries = 3
-    base_delay = 2
-    for attempt in range(max_retries):
+def _apiyi_create_veo_task(prompt: str, model: str, image_files: Optional[List] = None) -> str:
+    headers = {"Authorization": _require_api_key()}
+    if image_files:
+        files = []
+        for image_file in image_files[:2]:
+            image_b64, mime_type = _file_to_base64(image_file)
+            if not image_b64:
+                raise ValueError("参考图为空或无法读取，请重新上传后再试。")
+            image_bytes = base64.b64decode(image_b64)
+            filename = getattr(image_file, "name", "frame.png")
+            files.append(("input_reference", (filename, image_bytes, mime_type)))
         resp = requests.post(
-            f"{APIYI_BASE}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=600,
-            stream=True,
+            f"{APIYI_BASE}/v1/videos",
+            headers=headers,
+            data={"prompt": prompt, "model": model},
+            files=files,
+            timeout=300,
         )
-        if resp.status_code < 400:
-            break
-        body = resp.text
-        if _should_retry_video_error(body) and attempt < max_retries - 1:
-            time.sleep(base_delay * (2 ** attempt))
-            continue
-        raise ValueError(body)
+    else:
+        resp = requests.post(
+            f"{APIYI_BASE}/v1/videos",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"prompt": prompt, "model": model},
+            timeout=300,
+        )
+    if resp.status_code >= 400:
+        raise ValueError(resp.text)
+    payload = resp.json()
+    video_id = payload.get("id")
+    if not video_id:
+        raise ValueError("创建任务失败，未返回 video_id。")
+    return video_id
 
-    text_chunks: List[str] = []
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if line.startswith("data: "):
-            line = line[len("data: "):]
-        if line == "[DONE]":
-            break
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        delta = (data.get("choices") or [{}])[0].get("delta") or {}
-        content = delta.get("content")
-        if content:
-            text_chunks.append(content)
 
-    full_text = "".join(text_chunks)
-    video_url = _extract_video_url(full_text)
-    if not video_url:
-        raise ValueError("未解析到视频地址，请重试。")
+def _apiyi_get_veo_status(video_id: str) -> dict:
+    resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}",
+        headers={"Authorization": _require_api_key()},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise ValueError(resp.text)
+    return resp.json()
 
-    video_resp = requests.get(video_url, timeout=600)
-    video_resp.raise_for_status()
-    return video_resp.content
+
+def _apiyi_get_veo_content(video_id: str) -> dict:
+    resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}/content",
+        headers={"Authorization": _require_api_key()},
+        timeout=120,
+    )
+    if resp.status_code >= 400:
+        raise ValueError(resp.text)
+    return resp.json()
+
+
+def _apiyi_wait_for_veo(video_id: str, timeout: int = 900, interval: int = 6) -> dict:
+    start = time.time()
+    while time.time() - start < timeout:
+        status_data = _apiyi_get_veo_status(video_id)
+        status = status_data.get("status")
+        if status == "completed":
+            return _apiyi_get_veo_content(video_id)
+        if status == "failed":
+            raise ValueError(f"视频生成失败：{status_data}")
+        time.sleep(interval)
+    raise TimeoutError("等待视频生成超时。")
+
+
+def _apiyi_download_video(url: str) -> bytes:
+    resp = requests.get(url, timeout=600)
+    resp.raise_for_status()
+    return resp.content
 
 
 _inject_style()
@@ -497,7 +467,7 @@ with st.sidebar:
     st.subheader("🔐模型")
     # st.caption("API Key 已在 Streamlit Secrets 配置，不需要前台输入。")
     st.caption("图像模型：gemini-3-pro-image-preview")
-    st.caption("视频模型：veo-3.1-fl")
+    st.caption("视频模型：VEO 3.1（按画幅与帧模式自动选型）")
     response_text = st.toggle("返回文本说明", value=True)
 
     st.divider()
@@ -587,7 +557,7 @@ with right:
 st.write("")
 
 video_tab, image_gen_tab, image_edit_tab = st.tabs([
-    "🎞️ 图生视频 (Veo 接入位)",
+    "🎞️ 图生视频 (VEO 3.1)",
     "🖼️ 文生图 (Nano Banana)",
     "🧩 图生图 / 修图 (Nano Banana)",
 ])
@@ -595,56 +565,64 @@ video_tab, image_gen_tab, image_edit_tab = st.tabs([
 with video_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("图生视频 - 用于产品运镜")
-    st.caption("图生视频由 API易 Sora 2 模型生成（按画幅与时长自动选择型号）。")
+    st.caption("图生视频由 API易 VEO 3.1 生成（按画幅与帧模式自动选择型号，时长固定 8 秒）。")
 
     video_prompt = st.text_area(
         "视频提示词",
         "拍摄一瓶高端香氛，镜头从瓶身logo缓慢推近，浅景深，微微旋转，背景柔和灯带。",
         height=120,
     )
-    video_duration = st.number_input("视频时长 (秒)", min_value=1, max_value=15, value=10, step=1)
     video_ratio = st.selectbox("画幅", ["16:9", "9:16"])
+    use_fast = st.toggle("快速模式（速度更快，成本更低）", value=False)
     video_refs = []
     if product_images:
         video_refs = st.multiselect(
-            "参考图片（目前仅支持选择 1 张）",
+            "参考图片（可选 0-2 张，2 张为首尾帧模式）",
             product_images,
             default=product_images[:1],
             format_func=lambda f: f.name,
         )
 
     if st.button("生成运镜视频"):
-        if not product_images:
-            st.error("请先上传至少一张产品图片。")
-        elif not video_refs:
-            st.error("请选择至少一张参考图片。")
-        else:
-            st.session_state["last_video_versions"] = {}
-            with st.spinner("视频生成中..."):
-                final_prompt = (
-                    f"{video_prompt}\n"
-                    f"Aspect ratio: {video_ratio}\n"
-                    f"Duration: {video_duration}s"
-                )
-                try:
-                    if len(video_refs) > 1:
-                        st.info("Sora 2 图生视频当前仅支持 1 张参考图，已取第一张。")
-                    if video_duration not in (10, 15):
-                        st.info("Sora 2 仅支持 10s 或 15s，已自动匹配最近的时长配置。")
-                    model_name = _pick_sora_model(video_ratio, int(video_duration))
-                    video_bytes = _apiyi_generate_video_multi(video_refs, final_prompt, model=model_name)
-                    st.session_state["last_video_versions"][model_name] = video_bytes
-                except Exception as exc:
-                    st.error(f"视频生成失败：{exc}")
+        st.session_state["last_video_versions"] = []
+        with st.spinner("VEO 3.1 视频生成中..."):
+            final_prompt = video_prompt.strip()
+            use_frames = bool(video_refs)
+            model_name = _pick_veo_model(video_ratio, use_frames=use_frames, use_fast=use_fast)
+            try:
+                if len(video_refs) > 2:
+                    st.info("VEO 3.1 帧转视频最多支持 2 张参考图，已取前两张。")
+                video_id = _apiyi_create_veo_task(final_prompt, model_name, image_files=video_refs[:2])
+                result = _apiyi_wait_for_veo(video_id)
+                video_url = result.get("url")
+                if not video_url:
+                    raise ValueError("未获取到视频下载地址。")
+                video_bytes = _apiyi_download_video(video_url)
+                st.session_state["last_video_versions"].append({
+                    "model": model_name,
+                    "video_id": video_id,
+                    "url": video_url,
+                    "bytes": video_bytes,
+                    "resolution": result.get("resolution"),
+                    "duration": result.get("duration"),
+                })
+            except Exception as exc:
+                st.error(f"视频生成失败：{exc}")
 
     if "last_video_versions" in st.session_state and st.session_state["last_video_versions"]:
         st.markdown("**高清下载**")
-        for model_name, video_bytes in st.session_state["last_video_versions"].items():
+        for item in st.session_state["last_video_versions"]:
+            video_bytes = item["bytes"]
+            model_name = item["model"]
+            resolution = item.get("resolution")
+            duration = item.get("duration")
+            meta = f"{resolution or '未知分辨率'} / {duration or '8'}s"
+            st.caption(f"{model_name} · {meta}")
             st.video(video_bytes)
             st.download_button(
                 f"下载 {model_name} (MP4)",
                 data=video_bytes,
-                file_name=f"nanobanana_video_{model_name}.mp4",
+                file_name=f"veo_video_{model_name}.mp4",
                 mime="video/mp4",
             )
 

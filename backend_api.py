@@ -2,7 +2,7 @@ import base64
 import io
 import os
 import time
-from typing import Optional
+from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile
@@ -14,7 +14,6 @@ APIYI_BASE = os.getenv("APIYI_BASE", "https://api.apiyi.com")
 APIYI_API_KEY = os.getenv("APIYI_API_KEY")
 
 IMAGE_MODEL = "gemini-3-pro-image-preview"
-VIDEO_MODEL = "sora_video2"
 
 
 def _require_api_key() -> str:
@@ -23,13 +22,80 @@ def _require_api_key() -> str:
     return APIYI_API_KEY
 
 
-def _extract_video_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    for token in text.split():
-        if token.startswith("http") and token.endswith(".mp4"):
-            return token
-    return None
+def _pick_veo_model(video_ratio: str, use_frames: bool, use_fast: bool = False) -> str:
+    model = "veo-3.1"
+    if video_ratio == "16:9":
+        model += "-landscape"
+    if use_fast:
+        model += "-fast"
+    if use_frames:
+        model += "-fl"
+    return model
+
+
+async def _apiyi_create_veo_task(prompt: str, model: str, images: Optional[List[UploadFile]] = None) -> str:
+    headers = {"Authorization": _require_api_key()}
+    if images:
+        files = []
+        for image in images[:2]:
+            image_bytes = await image.read()
+            if not image_bytes:
+                raise ValueError("参考图为空")
+            mime_type = image.content_type or "image/png"
+            files.append(("input_reference", (image.filename or "frame.png", image_bytes, mime_type)))
+        resp = requests.post(
+            f"{APIYI_BASE}/v1/videos",
+            headers=headers,
+            data={"prompt": prompt, "model": model},
+            files=files,
+            timeout=300,
+        )
+    else:
+        resp = requests.post(
+            f"{APIYI_BASE}/v1/videos",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"prompt": prompt, "model": model},
+            timeout=300,
+        )
+    resp.raise_for_status()
+    payload = resp.json()
+    video_id = payload.get("id")
+    if not video_id:
+        raise ValueError("创建任务失败，未返回 video_id")
+    return video_id
+
+
+def _apiyi_get_veo_status(video_id: str) -> dict:
+    resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}",
+        headers={"Authorization": _require_api_key()},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _apiyi_get_veo_content(video_id: str) -> dict:
+    resp = requests.get(
+        f"{APIYI_BASE}/v1/videos/{video_id}/content",
+        headers={"Authorization": _require_api_key()},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _apiyi_wait_for_veo(video_id: str, timeout: int = 900, interval: int = 6) -> dict:
+    start = time.time()
+    while time.time() - start < timeout:
+        status_data = _apiyi_get_veo_status(video_id)
+        status = status_data.get("status")
+        if status == "completed":
+            return _apiyi_get_veo_content(video_id)
+        if status == "failed":
+            raise ValueError(f"视频生成失败：{status_data}")
+        time.sleep(interval)
+    raise TimeoutError("等待视频生成超时")
 
 
 @app.post("/image_generate")
@@ -104,91 +170,28 @@ async def image_edit(
     return JSONResponse(resp.json())
 
 
-def _pick_sora_model(video_ratio: str, duration_s: int) -> str:
-    is_landscape = video_ratio == "16:9"
-    use_15s = duration_s >= 13
-    if is_landscape:
-        return "sora_video2-landscape-15s" if use_15s else "sora_video2-landscape"
-    return "sora_video2-15s" if use_15s else "sora_video2"
-
-
-def _should_retry_video_error(body: str) -> bool:
-    if not body:
-        return False
-    lower = body.lower()
-    return "heavy load" in lower or "overloaded" in lower
-
-
 @app.post("/generate_video")
 async def generate_video(
-    image: UploadFile = File(...),
+    image: Optional[List[UploadFile]] = File(None),
     prompt: str = Form(...),
     video_ratio: str = Form("16:9"),
-    video_duration: int = Form(10),
+    use_fast: bool = Form(False),
 ):
-    key = _require_api_key()
-    image_bytes = await image.read()
-    if not image_bytes:
-        return JSONResponse({"error": "参考图为空"}, status_code=400)
-    mime_type = image.content_type or "image/png"
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    parts = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
-    ]
-
-    payload = {
-        "model": _pick_sora_model(video_ratio, int(video_duration)),
-        "stream": True,
-        "messages": [
-            {"role": "user", "content": parts},
-        ],
-    }
-
-    max_retries = 3
-    base_delay = 2
-    resp = None
-    for attempt in range(max_retries):
-        resp = requests.post(
-            f"{APIYI_BASE}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=600,
-            stream=True,
+    images = image or []
+    use_frames = bool(images)
+    model = _pick_veo_model(video_ratio, use_frames=use_frames, use_fast=use_fast)
+    try:
+        video_id = await _apiyi_create_veo_task(prompt, model, images=images)
+        result = _apiyi_wait_for_veo(video_id)
+        video_url = result.get("url")
+        if not video_url:
+            return JSONResponse({"error": "未获取到视频地址", "raw": result}, status_code=502)
+        video_resp = requests.get(video_url, timeout=600)
+        video_resp.raise_for_status()
+        return StreamingResponse(
+            io.BytesIO(video_resp.content),
+            media_type="video/mp4",
+            headers={"X-Video-Model": model, "X-Video-Id": video_id},
         )
-        if resp.status_code < 400:
-            break
-        body = resp.text
-        if _should_retry_video_error(body) and attempt < max_retries - 1:
-            time.sleep(base_delay * (2 ** attempt))
-            continue
-        return JSONResponse({"error": "生成失败", "raw": body}, status_code=502)
-
-    text_chunks: List[str] = []
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if line.startswith("data: "):
-            line = line[len("data: "):]
-        if line == "[DONE]":
-            break
-        try:
-            data = json.loads(line)
-        except ValueError:
-            continue
-        delta = (data.get("choices") or [{}])[0].get("delta") or {}
-        content = delta.get("content")
-        if content:
-            text_chunks.append(content)
-
-    video_url = _extract_video_url("".join(text_chunks))
-    if not video_url:
-        return JSONResponse({"error": "未解析到视频地址"}, status_code=502)
-
-    video_resp = requests.get(video_url, timeout=600)
-    video_resp.raise_for_status()
-    return StreamingResponse(
-        io.BytesIO(video_resp.content),
-        media_type="video/mp4",
-        headers={"X-Video-Model": VIDEO_MODEL},
-    )
+    except Exception as exc:
+        return JSONResponse({"error": "生成失败", "raw": str(exc)}, status_code=502)
